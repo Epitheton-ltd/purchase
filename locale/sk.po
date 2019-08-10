@@ -663,7 +663,7 @@ msgstr "Celkovo"
 
 msgctxt "field:purchase.purchase,total_amount_cache:"
 msgid "Total Cache"
-msgstr ""
+msgstr "Záloha celkovo"
 
 msgctxt "field:purchase.purchase,untaxed_amount:"
 msgid "Untaxed"
@@ -675,7 +675,7 @@ msgstr "Nezdaniteľná záloha"
 
 msgctxt "field:purchase.purchase,warehouse:"
 msgid "Warehouse"
-msgstr "Veľkoobchod"
+msgstr "Veľkosklad"
 
 msgctxt "field:purchase.purchase,write_date:"
 msgid "Write Date"
