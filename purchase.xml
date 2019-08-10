@@ -18,15 +18,6 @@ this repository contains the full copyright notices and license terms. -->
             <field name="group" ref="group_purchase_admin"/>
         </record>
 
-        <record model="res.user-res.group" id="user_trigger_group_purchase">
-            <field name="user" ref="res.user_trigger"/>
-            <field name="group" ref="group_purchase"/>
-        </record>
-        <record model="res.user-res.group" id="user_trigger_group_purchase_admin">
-            <field name="user" ref="res.user_trigger"/>
-            <field name="group" ref="group_purchase_admin"/>
-        </record>
-
         <record model="ir.ui.icon" id="purchase_icon">
             <field name="name">tryton-purchase</field>
             <field name="path">icons/tryton-purchase.svg</field>
@@ -290,10 +281,9 @@ this repository contains the full copyright notices and license terms. -->
             <field name="model"
                 search="[('model', '=', 'purchase.purchase')]"/>
         </record>
-        <record model="ir.model.button-res.group"
-            id="purchase_process_button_group_purchase">
+        <record model="ir.model.button-res.group" id="purchase_process_button_group_purchase_admin">
             <field name="button" ref="purchase_process_button"/>
-            <field name="group" ref="group_purchase"/>
+            <field name="group" ref="group_purchase_admin"/>
         </record>
 
         <record model="ir.model.button" id="purchase_modify_header_button">
@@ -448,6 +438,7 @@ this repository contains the full copyright notices and license terms. -->
             id="menu_product_supplier" action="act_product_supplier_form"/>
 
         <record model="ir.rule.group" id="rule_group_product_supplier">
+            <field name="name">User in company</field>
             <field name="model" search="[('model', '=', 'purchase.product_supplier')]"/>
             <field name="global_p" eval="True"/>
         </record>
@@ -532,12 +523,6 @@ this repository contains the full copyright notices and license terms. -->
             <field name="name">template_tree</field>
         </record>
 
-        <record model="ir.ui.view" id="move_view_form">
-            <field name="model">stock.move</field>
-            <field name="inherit" ref="stock.move_view_form"/>
-            <field name="name">move_form</field>
-        </record>
-
         <record model="ir.action.wizard" id="act_open_supplier">
             <field name="name">Parties associated to Purchases</field>
             <field name="wiz_name">purchase.open_supplier</field>
@@ -563,6 +548,7 @@ this repository contains the full copyright notices and license terms. -->
         </record>
 
         <record model="ir.rule.group" id="rule_group_purchase">
+            <field name="name">User in company</field>
             <field name="model" search="[('model', '=', 'purchase.purchase')]"/>
             <field name="global_p" eval="True"/>
         </record>

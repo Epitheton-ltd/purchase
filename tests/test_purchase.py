@@ -34,11 +34,11 @@ class PurchaseTestCase(ModuleTestCase):
             create_chart(company)
 
             receivable, = Account.search([
-                    ('kind', '=', 'receivable'),
+                    ('type.receivable', '=', True),
                     ('company', '=', company.id),
                     ])
             payable, = Account.search([
-                    ('kind', '=', 'payable'),
+                    ('type.payable', '=', True),
                     ('company', '=', company.id),
                     ])
 
@@ -62,7 +62,7 @@ class PurchaseTestCase(ModuleTestCase):
                         'account_payable': payable.id,
                         }])
             product_supplier, = ProductSupplier.create([{
-                        'product': template.id,
+                        'template': template.id,
                         'party': supplier.id,
                         'prices': [('create', [{
                                         'sequence': 1,

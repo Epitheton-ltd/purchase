@@ -8,8 +8,10 @@ from sql import Literal, Null
 from sql.aggregate import Count
 from sql.operators import Concat
 
+from trytond.i18n import gettext
 from trytond.model import Workflow, Model, ModelView, ModelSQL, fields, \
     sequence_ordered
+from trytond.model.exceptions import AccessError
 from trytond.modules.company import CompanyReport
 from trytond.wizard import Wizard, StateAction, StateView, StateTransition, \
     Button
@@ -19,7 +21,10 @@ from trytond.transaction import Transaction
 from trytond.pool import Pool
 
 from trytond.modules.account.tax import TaxableMixin
+from trytond.modules.account_product.exceptions import AccountError
 from trytond.modules.product import price_digits
+
+from .exceptions import PurchaseQuotationError, PartyLocationError
 
 __all__ = ['Purchase', 'PurchaseIgnoredInvoice',
     'PurchaseRecreadtedInvoice', 'PurchaseLine', 'PurchaseLineTax',
@@ -161,8 +166,9 @@ class Purchase(Workflow, ModelSQL, ModelView, TaxableMixin):
             ('paid', 'Paid'),
             ('exception', 'Exception'),
             ], 'Invoice State', readonly=True, required=True)
-    invoices = fields.Function(fields.One2Many('account.invoice', None,
-            'Invoices'), 'get_invoices', searcher='search_invoices')
+    invoices = fields.Function(fields.Many2Many(
+            'account.invoice', None, None, "Invoices"),
+        'get_invoices', searcher='search_invoices')
     invoices_ignored = fields.Many2Many(
             'purchase.purchase-ignored-account.invoice',
             'purchase', 'invoice', 'Ignored Invoices', readonly=True)
@@ -183,10 +189,11 @@ class Purchase(Workflow, ModelSQL, ModelView, TaxableMixin):
             ('received', 'Received'),
             ('exception', 'Exception'),
             ], 'Shipment State', readonly=True, required=True)
-    shipments = fields.Function(fields.One2Many('stock.shipment.in', None,
-            'Shipments'), 'get_shipments', searcher='search_shipments')
-    shipment_returns = fields.Function(
-        fields.One2Many('stock.shipment.in.return', None, 'Shipment Returns'),
+    shipments = fields.Function(fields.Many2Many(
+            'stock.shipment.in', None, None, "Shipments"),
+        'get_shipments', searcher='search_shipments')
+    shipment_returns = fields.Function(fields.Many2Many(
+            'stock.shipment.in.return', None, None, "Shipment Returns"),
         'get_shipment_returns', searcher='search_shipment_returns')
     moves = fields.One2Many('stock.move', 'purchase', 'Moves', readonly=True)
 
@@ -197,12 +204,6 @@ class Purchase(Workflow, ModelSQL, ModelView, TaxableMixin):
             ('purchase_date', 'DESC'),
             ('id', 'DESC'),
             ]
-        cls._error_messages.update({
-                'warehouse_required': ('A warehouse must be defined for '
-                    'quotation of purchase "%s".'),
-                'delete_cancel': ('Purchase "%s" must be cancelled before '
-                    'deletion.'),
-                })
         cls._transitions |= set((
                 ('draft', 'quotation'),
                 ('quotation', 'confirmed'),
@@ -246,7 +247,10 @@ class Purchase(Workflow, ModelSQL, ModelView, TaxableMixin):
                     'depends': ['state'],
                     },
                 'process': {
-                    'invisible': Eval('state') != 'confirmed',
+                    'invisible': ~Eval('state').in_(
+                        ['confirmed', 'processing']),
+                    'icon': If(Eval('state') == 'confirmed',
+                        'tryton-forward', 'tryton-refresh'),
                     'depends': ['state'],
                     },
                 'handle_invoice_exception': {
@@ -645,7 +649,9 @@ class Purchase(Workflow, ModelSQL, ModelView, TaxableMixin):
             if (not line.to_location
                     and line.product
                     and line.product.type in ('goods', 'assets')):
-                self.raise_user_error('warehouse_required', (self.rec_name,))
+                raise PurchaseQuotationError(
+                    gettext('purchase.msg_warehouse_required_for_quotation',
+                        purchase=self.rec_name))
 
     @classmethod
     def set_number(cls, purchases):
@@ -785,7 +791,9 @@ class Purchase(Workflow, ModelSQL, ModelView, TaxableMixin):
         cls.cancel(purchases)
         for purchase in purchases:
             if purchase.state != 'cancel':
-                cls.raise_user_error('delete_cancel', purchase.rec_name)
+                raise AccessError(
+                    gettext('purchase.msg_purchase_delete_cancel',
+                        purchase=purchase.rec_name))
         super(Purchase, cls).delete(purchases)
 
     @classmethod
@@ -846,7 +854,10 @@ class Purchase(Workflow, ModelSQL, ModelView, TaxableMixin):
     @ModelView.button
     def process(cls, purchases):
         process, done = [], []
+        cls.lock(purchases)
         for purchase in purchases:
+            if purchase.state not in {'confirmed', 'processing', 'done'}:
+                continue
             purchase.create_invoice()
             purchase.set_invoice_state()
             purchase.create_move('in')
@@ -938,10 +949,9 @@ class PurchaseLine(sequence_ordered(), ModelSQL, ModelView):
     product = fields.Many2One('product.product', 'Product',
         ondelete='RESTRICT',
         domain=[
-            ('purchasable', '=', True),
-            If(Bool(Eval('product_supplier')),
-                ('product_suppliers', '=', Eval('product_supplier')),
-                ()),
+            If(Eval('purchase_state').in_(['draft', 'quotation']),
+                [('purchasable', '=', True)],
+                []),
             ],
         states={
             'invisible': Eval('type') != 'line',
@@ -969,8 +979,14 @@ class PurchaseLine(sequence_ordered(), ModelSQL, ModelView):
         ondelete='RESTRICT',
         domain=[
             If(Bool(Eval('product')),
-                ('product.products', '=', Eval('product')),
-                ()),
+                ['OR',
+                    [
+                        ('template.products', '=', Eval('product')),
+                        ('product', '=', None),
+                        ],
+                    ('product', '=', Eval('product')),
+                    ],
+                []),
             ('party', '=', Eval('_parent_purchase', {}).get('party')),
             ],
         states={
@@ -1057,20 +1073,6 @@ class PurchaseLine(sequence_ordered(), ModelSQL, ModelView):
         'on_change_with_purchase_state')
 
     @classmethod
-    def __setup__(cls):
-        super(PurchaseLine, cls).__setup__()
-        cls._error_messages.update({
-                'supplier_location_required': ('Purchase "%(purchase)s" '
-                    'misses the supplier location for line "%(line)s".'),
-                'missing_account_expense': ('Product "%(product)s" of '
-                    'purchase %(purchase)s misses an expense account.'),
-                'missing_default_account_expense': ('Purchase "%(purchase)s" '
-                    'misses a default "account expense".'),
-                'delete_cancel_draft': ('The line "%(line)s" must be on '
-                    'canceled or draft purchase to be deleted.'),
-                })
-
-    @classmethod
     def __register__(cls, module_name):
         super(PurchaseLine, cls).__register__(module_name)
         table = cls.__table_handler__(module_name)
@@ -1150,9 +1152,16 @@ class PurchaseLine(sequence_ordered(), ModelSQL, ModelView):
         context['taxes'] = [t.id for t in self.taxes or []]
         return context
 
+    @fields.depends('purchase', '_parent_purchase.party')
+    def _get_product_supplier_pattern(self):
+        return {
+            'party': self.purchase.party.id if self.purchase.party else -1,
+            }
+
     @fields.depends('product', 'unit', 'quantity', 'purchase',
         '_parent_purchase.party', 'product_supplier',
-        methods=['_get_tax_rule_pattern', '_get_context_purchase_price'])
+        methods=['_get_tax_rule_pattern', '_get_context_purchase_price',
+            '_get_product_supplier_pattern'])
     def on_change_product(self):
         pool = Pool()
         Product = pool.get('product.product')
@@ -1186,14 +1195,12 @@ class PurchaseLine(sequence_ordered(), ModelSQL, ModelView):
             self.unit = self.product.purchase_uom
             self.unit_digits = self.product.purchase_uom.digits
 
-        if self.purchase and self.purchase.party:
-            product_suppliers = [ps for ps in self.product.product_suppliers
-                if ps.party == self.purchase.party]
-            if len(product_suppliers) == 1:
-                self.product_supplier, = product_suppliers
-        if (self.product_supplier
-                and (self.product_supplier
-                    not in self.product.product_suppliers)):
+        product_suppliers = list(self.product.product_suppliers_used(
+                **self._get_product_supplier_pattern()))
+        if len(product_suppliers) == 1:
+            self.product_supplier, = product_suppliers
+        elif (self.product_supplier
+                and self.product_supplier not in product_suppliers):
             self.product_supplier = None
 
         with Transaction().set_context(self._get_context_purchase_price()):
@@ -1209,9 +1216,12 @@ class PurchaseLine(sequence_ordered(), ModelSQL, ModelView):
     @fields.depends('product', 'product_supplier',
         methods=['on_change_product'])
     def on_change_product_supplier(self):
-        if not self.product and self.product_supplier:
-            if len(self.product_supplier.product.products) == 1:
-                self.product, = self.product_supplier.product.products
+        if self.product_supplier:
+            if self.product_supplier.product:
+                self.product = self.product_supplier.product
+            elif not self.product:
+                if len(self.product_supplier.template.products) == 1:
+                    self.product, = self.product_supplier.template.products
         self.on_change_product()
 
     @fields.depends('product')
@@ -1283,8 +1293,8 @@ class PurchaseLine(sequence_ordered(), ModelSQL, ModelView):
         else:
             return self.purchase.party.supplier_location.id
 
-    @fields.depends('product', 'quantity', 'moves', 'purchase',
-        '_parent_purchase.purchase_date', '_parent_purchase.party',
+    @fields.depends('product_supplier', 'quantity', 'moves', 'purchase',
+        '_parent_purchase.purchase_date',
         'delivery_date_edit', 'delivery_date_store',
         '_parent_purchase.delivery_date')
     def on_change_with_delivery_date(self, name=None):
@@ -1300,19 +1310,15 @@ class PurchaseLine(sequence_ordered(), ModelSQL, ModelView):
             delivery_date = self.delivery_date_store
         elif self.purchase and self.purchase.delivery_date:
             delivery_date = self.purchase.delivery_date
-        elif (self.product
+        elif (self.product_supplier
                 and self.quantity is not None
                 and self.quantity > 0
-                and self.purchase and self.purchase.party
-                and self.product.product_suppliers):
+                and self.purchase):
             date = self.purchase.purchase_date if self.purchase else None
-            for product_supplier in self.product.product_suppliers:
-                if product_supplier.party == self.purchase.party:
-                    delivery_date = product_supplier.compute_supply_date(
-                        date=date)
-                    if delivery_date == datetime.date.max:
-                        delivery_date = None
-                    break
+            delivery_date = self.product_supplier.compute_supply_date(
+                date=date)
+            if delivery_date == datetime.date.max:
+                delivery_date = None
         if delivery_date and delivery_date < Date.today():
             delivery_date = None
         return delivery_date
@@ -1358,16 +1364,19 @@ class PurchaseLine(sequence_ordered(), ModelSQL, ModelView):
         if self.product:
             invoice_line.account = self.product.account_expense_used
             if not invoice_line.account:
-                self.raise_user_error('missing_account_expense', {
-                        'product': invoice_line.product.rec_name,
-                        'purchase': self.purchase.rec_name,
-                        })
+                raise AccountError(
+                    gettext('purchase'
+                        '.msg_purchase_product_missing_account_expense',
+                        purchase=self.purchase.rec_name,
+                        product=self.product.rec_name))
         else:
             invoice_line.account = account_config.get_multivalue(
                 'default_category_account_expense')
             if not invoice_line.account:
-                self.raise_user_error('missing_default_account_expense',
-                    {'purchase': self.purchase.rec_name})
+                raise AccountError(
+                    gettext('purchase'
+                        '.msg_purchase_missing_account_expense',
+                        purchase=self.purchase.rec_name))
         invoice_line.stock_moves = self._get_invoice_line_moves()
         return [invoice_line]
 
@@ -1447,10 +1456,10 @@ class PurchaseLine(sequence_ordered(), ModelSQL, ModelView):
             return
 
         if not self.purchase.party.supplier_location:
-            self.raise_user_error('supplier_location_required', {
-                    'purchase': self.purchase.rec_name,
-                    'line': self.rec_name,
-                    })
+            raise PartyLocationError(
+                gettext('purchase.msg_purchase_supplier_location_required',
+                    purchase=self.purchase.rec_name,
+                    party=self.purchase.party.rec_name))
         move = Move()
         move.quantity = quantity
         move.uom = self.unit
@@ -1521,9 +1530,10 @@ class PurchaseLine(sequence_ordered(), ModelSQL, ModelView):
     def delete(cls, lines):
         for line in lines:
             if line.purchase_state not in {'cancel', 'draft'}:
-                cls.raise_user_error('delete_cancel_draft', {
-                        'line': line.rec_name,
-                        })
+                raise AccessError(
+                    gettext('purchase.msg_purchase_line_delete_cancel_draft',
+                        line=line.rec_name,
+                        purchase=line.purchase.rec_name))
         super(PurchaseLine, cls).delete(lines)
 
     @classmethod
@@ -1759,24 +1769,15 @@ class ModifyHeader(Wizard):
             ])
     modify = StateTransition()
 
-    @classmethod
-    def __setup__(cls):
-        super(ModifyHeader, cls).__setup__()
-        cls._error_messages.update({
-                'not_in_draft': (
-                    'The purchase "%(purchase)s" must be in draft '
-                    'to modify header.'),
-                })
-
     def get_purchase(self):
         pool = Pool()
         Purchase = pool.get('purchase.purchase')
 
         purchase = Purchase(Transaction().context['active_id'])
         if purchase.state != 'draft':
-            self.raise_user_error('not_in_draft', {
-                    'purchase': purchase.rec_name,
-                    })
+            raise AccessError(
+                gettext('purchase.msg_purchase_modify_header_draft',
+                    purchase=purchase.rec_name))
         return purchase
 
     def default_start(self, fields):

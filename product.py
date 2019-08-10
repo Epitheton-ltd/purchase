@@ -5,13 +5,17 @@ import datetime
 from sql import Literal
 from sql.aggregate import Count
 
+from trytond.i18n import gettext
 from trytond.model import ModelView, ModelSQL, MatchMixin, fields, \
     sequence_ordered
-from trytond.pyson import Eval, If
+from trytond.pyson import Eval, If, Bool
 from trytond.pool import Pool, PoolMeta
 from trytond.transaction import Transaction
+from trytond.tools import lstrip_wildcard
 
 from trytond.modules.product import price_digits
+
+from .exceptions import PurchaseUOMWarning
 
 __all__ = ['Template', 'Product', 'ProductSupplier', 'ProductSupplierPrice']
 
@@ -21,12 +25,14 @@ class Template(metaclass=PoolMeta):
     purchasable = fields.Boolean('Purchasable', states={
             'readonly': ~Eval('active', True),
             }, depends=['active'])
-    product_suppliers = fields.One2Many('purchase.product_supplier',
-        'product', 'Suppliers', states={
+    product_suppliers = fields.One2Many(
+        'purchase.product_supplier', 'template', "Suppliers",
+        states={
             'readonly': ~Eval('active', True),
             'invisible': (~Eval('purchasable', False)
                 | ~Eval('context', {}).get('company')),
-            }, depends=['active', 'purchasable'])
+            },
+        depends=['active', 'purchasable'])
     purchase_uom = fields.Many2One('product.uom', 'Purchase UOM', states={
             'readonly': ~Eval('active'),
             'invisible': ~Eval('purchasable'),
@@ -34,14 +40,6 @@ class Template(metaclass=PoolMeta):
             },
         domain=[('category', '=', Eval('default_uom_category'))],
         depends=['active', 'purchasable', 'default_uom_category'])
-
-    @classmethod
-    def __setup__(cls):
-        super(Template, cls).__setup__()
-        cls._error_messages.update({
-                'change_purchase_uom': ('Purchase prices are based '
-                    'on the purchase uom.'),
-                })
 
     @fields.depends('default_uom', 'purchase_uom', 'purchasable')
     def on_change_default_uom(self):
@@ -63,8 +61,15 @@ class Template(metaclass=PoolMeta):
                     'invisible': ~Eval('purchasable'),
                     })]
 
+    def product_suppliers_used(self, **pattern):
+        for product_supplier in self.product_suppliers:
+            if product_supplier.match(pattern):
+                yield product_supplier
+
     @classmethod
     def write(cls, *args):
+        pool = Pool()
+        Warning = pool.get('res.user.warning')
         actions = iter(args)
         for templates, values in zip(actions, actions):
             if not values.get("purchase_uom"):
@@ -77,15 +82,27 @@ class Template(metaclass=PoolMeta):
                 for product in template.products:
                     if not product.product_suppliers:
                         continue
-                    cls.raise_user_warning(
-                            '%s@product_template' % template.id,
-                            'change_purchase_uom')
+                    name = '%s@product_template' % template.id
+                    if Warning.check(name):
+                        raise PurchaseUOMWarning(
+                            name, gettext('purchase.msg_change_purchase_uom'))
         super(Template, cls).write(*args)
 
 
 class Product(metaclass=PoolMeta):
     __name__ = 'product.product'
 
+    product_suppliers = fields.One2Many(
+        'purchase.product_supplier', 'product', "Suppliers",
+        domain=[
+            ('template', '=', Eval('template')),
+            ],
+        states={
+            'readonly': ~Eval('active', True),
+            'invisible': (~Eval('purchasable', False)
+                | ~Eval('context', {}).get('company')),
+            },
+        depends=['template', 'active', 'purchasable'])
     purchase_price_uom = fields.Function(fields.Numeric(
             "Purchase Price", digits=price_digits), 'get_purchase_price_uom')
 
@@ -93,6 +110,13 @@ class Product(metaclass=PoolMeta):
     def get_purchase_price_uom(cls, products, name):
         quantity = Transaction().context.get('quantity') or 0
         return cls.get_purchase_price(products, quantity=quantity)
+
+    def product_suppliers_used(self, **pattern):
+        for product_supplier in self.product_suppliers:
+            if product_supplier.match(pattern):
+                yield product_supplier
+        pattern['product'] = None
+        yield from self.template.product_suppliers_used(**pattern)
 
     @classmethod
     def get_purchase_price(cls, products, quantity=0):
@@ -137,21 +161,18 @@ class Product(metaclass=PoolMeta):
             else:
                 product_uom = uom
             pattern = ProductSupplier.get_pattern()
-            product_suppliers = product.product_suppliers
-            if context.get('product_supplier'):
-                for product_supplier in product.product_suppliers:
-                    if product_supplier.id == context['product_supplier']:
-                        product_suppliers = [product_supplier]
-                        break
-            for product_supplier in product_suppliers:
-                if product_supplier.match(pattern):
-                    pattern = ProductSupplierPrice.get_pattern()
-                    for price in product_supplier.prices:
-                        if price.match(quantity, product_uom, pattern):
-                            prices[product.id] = price.unit_price
-                            default_uom = product_supplier.uom
-                            default_currency = product_supplier.currency
-                    break
+            product_suppliers = product.product_suppliers_used(**pattern)
+            try:
+                product_supplier = next(product_suppliers)
+            except StopIteration:
+                pass
+            else:
+                pattern = ProductSupplierPrice.get_pattern()
+                for price in product_supplier.prices:
+                    if price.match(quantity, product_uom, pattern):
+                        prices[product.id] = price.unit_price
+                        default_uom = product_supplier.uom
+                        default_currency = product_supplier.currency
             prices[product.id] = Uom.compute_price(
                 default_uom, prices[product.id], product_uom)
             if currency and default_currency:
@@ -165,8 +186,23 @@ class Product(metaclass=PoolMeta):
 class ProductSupplier(sequence_ordered(), ModelSQL, ModelView, MatchMixin):
     'Product Supplier'
     __name__ = 'purchase.product_supplier'
-    product = fields.Many2One('product.template', 'Product', required=True,
-            ondelete='CASCADE', select=True)
+    template = fields.Many2One(
+        'product.template', "Product",
+        required=True, ondelete='CASCADE', select=True,
+        domain=[
+            If(Bool(Eval('product')),
+                ('products', '=', Eval('product')),
+                ()),
+            ],
+        depends=['product'])
+    product = fields.Many2One(
+        'product.product', "Variant", select=True,
+        domain=[
+            If(Bool(Eval('template')),
+                ('template', '=', Eval('template')),
+                ()),
+            ],
+        depends=['template'])
     party = fields.Many2One('party.party', 'Supplier', required=True,
         ondelete='CASCADE', select=True)
     name = fields.Char('Name', size=None, translate=True, select=True)
@@ -189,6 +225,11 @@ class ProductSupplier(sequence_ordered(), ModelSQL, ModelView, MatchMixin):
         cursor = transaction.connection.cursor()
         table = cls.__table_handler__(module_name)
         sql_table = cls.__table__()
+
+        # Migration from 5.0: add product/template
+        if (table.column_exist('product')
+                and not table.column_exist('template')):
+            table.column_rename('product', 'template')
 
         super(ProductSupplier, cls).__register__(module_name)
 
@@ -217,6 +258,11 @@ class ProductSupplier(sequence_ordered(), ModelSQL, ModelView, MatchMixin):
             company = Company(Transaction().context['company'])
             return company.currency.id
 
+    @fields.depends('product', 'template')
+    def on_change_product(self):
+        if self.product:
+            self.template = self.product.template
+
     @fields.depends('party')
     def on_change_party(self):
         cursor = Transaction().connection.cursor()
@@ -232,11 +278,15 @@ class ProductSupplier(sequence_ordered(), ModelSQL, ModelView, MatchMixin):
                 self.currency, = row
 
     def get_rec_name(self, name):
-        if self.code:
-            name = self.name or self.product.name
-            return '[' + self.code + '] ' + name
+        if self.name:
+            name = self.name
+        elif self.product:
+            name = self.product.name
         else:
-            return self.name or self.product.rec_name
+            name = self.template.name
+        if self.code:
+            name = '[' + self.code + '] ' + name
+        return name
 
     @classmethod
     def search_rec_name(cls, name, clause):
@@ -244,17 +294,24 @@ class ProductSupplier(sequence_ordered(), ModelSQL, ModelView, MatchMixin):
             bool_op = 'AND'
         else:
             bool_op = 'OR'
+        code_value = clause[2]
+        if clause[1].endswith('like'):
+            code_value = lstrip_wildcard(clause[2])
         domain = [bool_op,
+            ('template',) + tuple(clause[1:]),
             ('product',) + tuple(clause[1:]),
             ('party',) + tuple(clause[1:]),
-            ('code',) + tuple(clause[1:]),
+            ('code', clause[1], code_value) + tuple(clause[3:]),
             ('name',) + tuple(clause[1:]),
             ]
         return domain
 
     @property
     def uom(self):
-        return self.product.purchase_uom
+        if self.product:
+            return self.product.purchase_uom
+        else:
+            return self.template.purchase_uom
 
     def compute_supply_date(self, date=None):
         '''
@@ -281,9 +338,10 @@ class ProductSupplier(sequence_ordered(), ModelSQL, ModelView, MatchMixin):
     @staticmethod
     def get_pattern():
         context = Transaction().context
-        return {
-            'party': context.get('supplier'),
-            }
+        pattern = {'party': context.get('supplier')}
+        if 'product_supplier' in context:
+            pattern['id'] = context['product_supplier']
+        return pattern
 
 
 class ProductSupplierPrice(
